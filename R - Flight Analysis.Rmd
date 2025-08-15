@@ -1,0 +1,984 @@
+---
+author: "Cheryl"
+output: html_document
+---
+
+The dataset includes information on flight arrival and departure for all commercial flights in the United States from 2003 to 2007. It contains a variety of fields, such as the date, time, airline, origin and destination airports, and information related to departure and arrival delays.
+
+# Load library
+
+-   `DBI` is database interface for connecting to database.
+-   `RSQLite` is used for SQLite database connection.
+-   `dplyr` is used for data manipulation.
+-   `ggplot2` is used for data visualization.
+-   `ggthemes` is an extension to ggplot2 where there is additional themes and charts for data visualization.
+
+```{r}
+library('DBI')
+library('RSQLite')
+library('dplyr')
+library('ggplot2')
+library('ggthemes')
+```
+
+If the database "flights_r.db" exists in your working directory, the following code chunk will remove it.
+
+```{r}
+if (file.exists("flights_r.db"))
+  file.remove("flights_r.db")
+```
+
+# Connect database
+
+We use the `dbConnect()` function to create an object, conn, to connect to the SQLite driver to manipulate the database "flights_r.db".
+
+```{r}
+conn <- dbConnect(RSQLite::SQLite(), "flights_r.db")
+```
+
+# Load airports, carriers and planes dataset
+
+We will create some tables to the "flights_r.db" database. To do this, we first read the CSV files into data frames in R.
+
+```{r}
+airports <- read.csv("airports.csv", header = TRUE)
+carriers <- read.csv("carriers.csv", header = TRUE)
+planes <- read.csv("plane-data.csv", header = TRUE)
+```
+
+Next, we use DBI’s `dbWriteTable()` function to copy the airports, carriers, and planes data frames into tables within the "flights_r.db" database.
+
+```{r}
+dbWriteTable(conn, "airports", airports)
+dbWriteTable(conn, "carriers", carriers)
+dbWriteTable(conn, "planes", planes)
+```
+
+We will create a loop to load 2003 to 2007 data files directly from the compressed bz2 format and combine them to table named "flights" in the database.
+
+```{r}
+for(i in c(2003:2007)) {
+  filename <- paste0(i, ".csv.bz2")
+  print(paste("Processing:", filename))
+  flights <- read.csv(filename, header = TRUE)
+  if(i == 2003) {
+    dbWriteTable(conn, "flights", flights)
+  } else {
+    dbWriteTable(conn, "flights", flights, append = TRUE)
+  }
+}
+```
+
+`dbListTables()` lists all tables in the connected database. `dbListFields()` lists all column names of a specified table in the database.
+
+```{r}
+dbListTables(conn)
+dbListFields(conn, "flights")
+```
+
+# Data Cleaning and Preparation
+
+First, we will ensure that the data is clean and reliable. We will use `dbGetQuery` to retrieve the first five rows from the flights table in the database to have a glimpse of the data.
+
+```{r}
+dbGetQuery(conn, "SELECT * FROM flights LIMIT 5")
+```
+
+We noticed that there were some missing values in the "flights" data set. Hence, we calculated the percentage of missing values in the data set to give an overview of the data.
+
+```{r}
+# Get the column names
+column_names <- dbListFields(conn, "flights")
+
+# Generate the SQL query 
+missing_na <- paste0(
+  "SELECT ",
+  paste(
+    sprintf("(COUNT(*) - COUNT(%s)) * 100.0 / COUNT(*) AS %s", column_names, column_names),
+    collapse = ", "
+  ),
+  " FROM flights"
+)
+
+# Execute the query
+missing_percentage <- dbGetQuery(conn, missing_na)
+
+print(missing_percentage)
+```
+
+We found that “CancellationCode”, “CarrierDelay”, “WeatherDelay”, “NASDelay”, “SecurityDelay”, “LateAircraftDelay” columns have the highest percentage of missing value of 7% in the dataset.
+
+Hence, we created a new table "**flights_clean**" in the database to avoid modifying the original data. We only kept columns that will be relevant for our analysis.
+
+```{r}
+dbExecute(conn, "CREATE TABLE flights_clean AS SELECT Year, Month, DayofMonth, DayOfWeek, DepTime, CRSDepTime, ArrTime, CRSArrTime, UniqueCarrier, FlightNum, TailNum, ActualElapsedTime, CRSElapsedTime, AirTime, ArrDelay, DepDelay, Origin, Dest, Distance, Cancelled, Diverted From flights")
+```
+
+Next, we looked at the missing values in the other columns.
+
+```{r}
+column_names <- dbListFields(conn, "flights_clean")
+
+missing <- paste0(
+  "SELECT ",
+  paste(
+    sprintf("(COUNT(*) - COUNT(%s)) * 100.0 / COUNT(*) AS %s", column_names, column_names),
+    collapse = ", "
+  ),
+  " FROM flights_clean"
+)
+
+missing_percent <- dbGetQuery(conn, missing)
+
+print(missing_percent)
+```
+
+There were missing values in these columns: DepTime, ArrTime, ActualElapsedTime, CRSElapsedTime, AirTime, ArrDelay and DepDelay. We then investigated whether the missing values in DepTime or ArrTime were due to flight cancellations or diversions.
+
+```{r}
+dbGetQuery(conn, "SELECT
+    Cancelled,
+    Diverted,
+    COUNT(*) AS TotalFlights,
+    SUM(CASE WHEN DepTime IS NULL THEN 1 ELSE 0 END) AS DepTime_NA,
+    SUM(CASE WHEN ArrTime IS NULL THEN 1 ELSE 0 END) AS ArrTime_NA
+  FROM flights_clean
+  GROUP BY Cancelled, Diverted")
+```
+
+We noticed that DepTime and ArrTime were related to the flight either being cancelled or diverted. We can see that when the flights are diverted, there is no ArrTime recorded. Similarly, when the flights are cancelled, there is no DepTime and ArrTime recorded. Therefore, the other columns would also have no values as the flights did not exist. We decided to fill those columns when DepTime or ArrTime is null, the other columns (ActualElapsedTime, CrsElapsedTime, AirTime, ArrDelay, DepDelay) would be 0.
+
+```{r}
+dbExecute(conn, 
+"UPDATE flights_clean
+SET
+  DepTime = COALESCE(DepTime, 0),
+  ArrTime = COALESCE(ArrTime, 0),
+  ActualElapsedTime = COALESCE(ActualElapsedTime, 0),
+  CRSElapsedTime = COALESCE(CRSElapsedTime, 0),
+  AirTime = COALESCE(AirTime, 0),
+  ArrDelay = COALESCE(ArrDelay, 0),
+  DepDelay = COALESCE(DepDelay, 0)
+WHERE DepTime IS NULL OR ArrTime IS NULL")
+```
+
+```{r}
+column_names2 <- dbListFields(conn, "flights_clean")
+
+missing_na2 <- paste0(
+  "SELECT ",
+  paste(
+    sprintf("(COUNT(*) - COUNT(%s)) * 100.0 / COUNT(*) AS %s", column_names2, column_names2),
+    collapse = ", "
+  ),
+  " FROM flights_clean"
+)
+
+missing_percentage2 <- dbGetQuery(conn, missing_na2)
+
+print(missing_percentage2)
+```
+
+We noticed that ActualElapsedTime and ArrDelay column still has missing values and went on to investigate.
+
+```{r}
+dbGetQuery(conn, "SELECT * FROM flights_clean WHERE ActualElapsedTime IS NULL")
+```
+
+We found that the missing value appeared in the same row. Since only one row had missing values for both columns, manual calculations were performed to determine the correct value. ActualElapsedTime is calculated using DepTime minus CRSDepTime. ArrDelay is calculated using ArrTime minus CRSArrTime.
+
+```{r}
+dbExecute(conn, "
+UPDATE flights_clean
+SET 
+    ActualElapsedTime = CASE 
+        WHEN ActualElapsedTime IS NULL THEN 
+            CASE 
+                WHEN (ArrTime % 100 + (ArrTime / 100) * 60) < (DepTime % 100 + (DepTime / 100) * 60) 
+                THEN ((ArrTime % 100 + (ArrTime / 100) * 60) + 1440) - (DepTime % 100 + (DepTime / 100) * 60)
+                ELSE (ArrTime % 100 + (ArrTime / 100) * 60) - (DepTime % 100 + (DepTime / 100) * 60)
+            END
+        ELSE ActualElapsedTime 
+    END,
+    ArrDelay = CASE 
+        WHEN ArrDelay IS NULL THEN 
+            CASE 
+                WHEN (ArrTime % 100 + (ArrTime / 100) * 60) < (CRSArrTime % 100 + (CRSArrTime / 100) * 60) 
+                THEN ((ArrTime % 100 + (ArrTime / 100) * 60) + 1440) - (CRSArrTime % 100 + (CRSArrTime / 100) * 60)
+                ELSE (ArrTime % 100 + (ArrTime / 100) * 60) - (CRSArrTime % 100 + (CRSArrTime / 100) * 60)
+            END
+        ELSE ArrDelay 
+    END
+WHERE ActualElapsedTime IS NULL OR ArrDelay IS NULL
+")
+
+```
+
+```{r}
+column_names3 <- dbListFields(conn, "flights_clean")
+
+missing3 <- paste0(
+  "SELECT ",
+  paste(
+    sprintf("(COUNT(*) - COUNT(%s)) * 100.0 / COUNT(*) AS %s", column_names3, column_names3),
+    collapse = ", "
+  ),
+  " FROM flights_clean"
+)
+
+missing_percentage3 <- dbGetQuery(conn, missing3)
+
+print(missing_percentage3)
+```
+
+Now, there are no missing values in the flights data set. We will proceed to prepare the data for analysis.
+
+We will first change DepTime and ArrTime for those timing that are more than 2400hrs. In the DepTime and ArrTime columns, some values exceeded 2400. To ensure correct time conversion, a conditional statement was applied: if a time value exceeded 2400, 2400 was subtracted to obtain the correct time.
+
+```{r}
+dbExecute(conn, "UPDATE flights_clean
+  SET
+    DepTime = CASE
+      WHEN DepTime >= 2400 THEN DepTime - 2400
+      ELSE DepTime
+    END,
+    ArrTime = CASE
+      WHEN ArrTime >= 2400 THEN ArrTime - 2400
+      ELSE ArrTime
+    END
+  WHERE DepTime >= 2400 OR ArrTime >= 2400")
+
+```
+
+We also converted the DayOfWeek column from numeric values to their corresponding day names.
+
+```{r}
+dbExecute(conn, "
+  UPDATE flights_clean
+  SET DayOfWeek = CASE
+    WHEN DayOfWeek = 1 THEN 'Monday'
+    WHEN DayOfWeek = 2 THEN 'Tuesday'
+    WHEN DayOfWeek = 3 THEN 'Wednesday'
+    WHEN DayOfWeek = 4 THEN 'Thursday'
+    WHEN DayOfWeek = 5 THEN 'Friday'
+    WHEN DayOfWeek = 6 THEN 'Saturday'
+    WHEN DayOfWeek = 7 THEN 'Sunday'
+  END
+")
+```
+
+# (a) What are the best times and days of the week to minimise delays each year?
+
+## (i) Best day of the week
+
+In this section, we will examine the percentage and average of flight delay by Day of Week.
+
+### Plot 1: Percentage of Flight delay by Day of Week
+
+We will be using arrival delay as the primary indicator of delay. If the flight arrives more than 15 minutes, it is considered delayed.
+
+```{r}
+percent_delay <- dbGetQuery(conn, "SELECT Year, DayOfWeek, 
+                        (SUM(CASE WHEN ArrDelay > 15 THEN 1 END) * 100.0 / COUNT(*)) AS DelayPercentage
+                        FROM flights_clean
+                        GROUP BY Year, DayOfWeek")
+```
+
+```{r}
+percent_delay$DayOfWeek <- factor(percent_delay$DayOfWeek, ordered = TRUE, 
+                              levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+
+```
+
+We will plot a bar plot using `geom_bar()`. `ggplot()` initializes a plot. The `aes(x = factor(Year), y = DelayPercentage, fill = DayOfWeek)` argument specifies that the x-axis represents years and it is converted to a categorical variable using `factor(Year)`, the y-axis represents the percentage of flight delays, and the bars are grouped and colored based on the DayOfWeek. `geom_text()` adds labels to the bars, displaying the percentage of delays rounded to one decimal place.`labs()` adds labels to the title, x-axis and y-axis. `scale_fill_brewer(palette = "Paired")` assigns a color scheme from the "Paired" palette to differentiate the days of the week.
+
+```{r}
+plot_1 <- ggplot(percent_delay, aes(x = factor(Year), y = DelayPercentage, fill = DayOfWeek)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = round(DelayPercentage, 1)), 
+            position = position_dodge(width = 0.9), 
+            vjust = 0.25, 
+            hjust = 1.5,
+            angle = 90, 
+            size = 3,
+            fontface = 'bold',
+            color = "black") +
+  labs(
+    title = "Figure 3.1 (R): Percentage of Flight Delay by Day of Week for Each Year",
+    x = "Year",
+    y = "Percentage of Flight Delay (%)",
+    fill = "Day of Week"
+  ) +
+  scale_fill_brewer(palette = "Paired") +
+  theme_classic() + 
+  theme(plot.title = element_text(size=11, hjust=0.5, face="bold"))
+
+print(plot_1)
+```
+
+**Observations from the plot above**
+
+There is an increasing trend in flight delays over the years, with notable fluctuations in different days of the week. We can see that delays tend to be more frequent on certain days such as Thursday and Friday across all years. Friday consistently recorded the highest percentage of delays from 2003 to 2007 with an increase from 17.5% to 26.7%. Meanwhile, Saturday consistently recorded the lowest percentage of delays from 2003 to 2007 with an increase from 12.6% to 19.5%. This pattern suggests that travellers should anticipate longer delays in the end of the work week, especially on Thursday and Friday.
+
+### Plot 2: Average Flight Delay by Day of Week
+
+```{r}
+avg_delay <- dbGetQuery(conn, "SELECT Year, DayOfWeek, AVG(ArrDelay) as AvgDelay
+                        FROM flights_clean
+                        WHERE ArrDelay > 15 AND Cancelled = 0 AND Diverted = 0
+                        GROUP BY Year, DayOfWeek")
+```
+
+```{r}
+avg_delay$DayOfWeek <- factor(avg_delay$DayOfWeek, ordered = TRUE, 
+                              levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+
+```
+
+```{r}
+plot_2 <- ggplot(avg_delay, aes(x = factor(Year), y = AvgDelay, fill = DayOfWeek)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.9) +
+  geom_text(aes(label = round(AvgDelay, 1)), 
+            position = position_dodge(width = 0.9), 
+            vjust = 0.25, 
+            hjust = 1.5,
+            angle = 90, 
+            size = 3,
+            fontface = 'bold',
+            color = "black") +
+  labs(
+    title = "Figure 4.1 (R): Average Flight Delay by Day of Week for Each Year",
+    x = "Year",
+    y = "Average Flight Delay (minutes)",
+    fill = "Day of Week"
+  ) +
+  scale_fill_brewer(palette = "Paired") +
+  theme_classic() + 
+  theme(plot.title = element_text(size=12, hjust=0.5, face="bold"))
+
+print(plot_2)
+```
+
+**Observations from the plot above**
+
+Saturday has the lowest average delay from 2003 to 2007 with an increase in duration from 47.7 minutes to 53.9 minutes. This suggests a decline in flights punctuality over the years with flight delays becoming more frequent and longer. Despite this increasing trend, Saturday remains the best day with the lowest delays for 5 consecutive years. Therefore, the best day to minimize flight delay is on Saturday.
+
+## (ii) Best time
+
+To determine the best time to minimize delays, we created the TimeInterval column by grouping arrival times into eight three-hour intervals. This allows us to analyze delay patterns across different times of the day.
+
+```{r}
+dbExecute(conn, "ALTER TABLE flights_clean ADD COLUMN TimeInterval TEXT")
+```
+
+```{r}
+dbExecute(conn, "UPDATE flights_clean
+    SET TimeInterval = 
+        CASE 
+            WHEN ArrTime BETWEEN 0 AND 259 THEN '0000-0259'
+            WHEN ArrTime BETWEEN 300 AND 559 THEN '0300-0559'
+            WHEN ArrTime BETWEEN 600 AND 859 THEN '0600-0859'
+            WHEN ArrTime BETWEEN 900 AND 1159 THEN '0900-1159'
+            WHEN ArrTime BETWEEN 1200 AND 1459 THEN '1200-1459'
+            WHEN ArrTime BETWEEN 1500 AND 1759 THEN '1500-1759'
+            WHEN ArrTime BETWEEN 1800 AND 2059 THEN '1800-2059'
+            WHEN ArrTime BETWEEN 2100 AND 2359 THEN '2100-2359'
+            ELSE 'Unknown'  
+        END")
+```
+
+In this section, we will examine the percentage and average of flight delay by Time Interval.
+
+### Plot 3: Percentage of Flight Delay by Time Interval
+
+```{r}
+percent_time_delay <- dbGetQuery(conn, "SELECT Year, TimeInterval, 
+                        (SUM(CASE WHEN ArrDelay > 15 THEN 1 END) * 100.0 / COUNT(*)) AS DelayPercentage
+                        FROM flights_clean
+                        WHERE Cancelled = 0 AND Diverted = 0
+                        GROUP BY Year, TimeInterval")
+```
+
+We will plot a line graph using `geom_line()` and `aes()` argument specifies that the x-axis represents the time interval and the y-axis represents the percentage of flight delays. The `color = factor(Year)` argument ensures that each year is represented by a different color, and `group = factor(Year)` ensures that data points for the same year are connected by a line. `scale_fill_brewer(palette = "Dark2")` assigns a color scheme from the "Dark2" palette to differentiate the year.
+
+```{r}
+plot_3 <- ggplot(percent_time_delay, aes(x = TimeInterval, y = DelayPercentage, color = factor(Year), group = factor(Year))) +
+  geom_line(size = 1) +  
+  geom_point(size = 2) +  
+  labs(
+    title = "Figure 5.1 (R): Percentage of Flight Delay by Time Interval for Each Year",
+    x = "Time Interval",
+    y = "Percentage of Flight Delay (%)",
+    color = "Year"
+  ) +
+  scale_color_brewer(palette = "Dark2") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+
+print(plot_3)
+
+```
+
+**Lowest Percentage Delay by Time Interval for Each Year**
+
+```{r}
+percent_time_delay <- dbGetQuery(conn, "
+    WITH ranked_percent_time_delays AS (
+        SELECT Year, TimeInterval,
+        (SUM(CASE WHEN ArrDelay > 15 THEN 1 END) * 100.0 / COUNT(*)) AS DelayPercentage,
+        ROW_NUMBER() OVER (PARTITION BY Year ORDER BY (SUM(CASE WHEN ArrDelay > 15 THEN 1 END) * 100.0 / COUNT(*))) AS rank
+        FROM flights_clean
+        WHERE Cancelled = 0 AND Diverted = 0
+        GROUP BY Year, TimeInterval
+    )
+    SELECT Year, TimeInterval, DelayPercentage
+    FROM ranked_percent_time_delays
+    WHERE rank = 1
+")
+
+print(percent_time_delay)
+```
+
+**Observations from the plot and table above**
+
+Early morning hours from 0600 to 0859 consistently show the lowest percentage of flight delay from 2003 to 2007 with an increase from 5.2% to 8.2%.
+
+### Plot 4: Average Flight Delay by Time Interval
+
+```{r}
+avg_time_delay <- dbGetQuery(conn, "SELECT Year, TimeInterval, AVG(ArrDelay) as AvgDelay
+                        FROM flights_clean
+                        WHERE ArrDelay > 15 AND Cancelled = 0 AND Diverted = 0
+                        GROUP BY Year, TimeInterval")
+```
+
+```{r}
+plot_4 <- ggplot(avg_time_delay, aes(x = TimeInterval, y = AvgDelay, color = factor(Year), group = factor(Year))) +
+  geom_line(size = 1) +  
+  geom_point(size = 2) +  
+  labs(
+    title = "Figure 6.1 (R): Average Flight Delay by Time Interval for Each Year",
+    x = "Time Interval",
+    y = "Average Flight Delay (minutes)",
+    color = "Year"
+  ) +
+  scale_color_brewer(palette = "Dark2") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+
+print(plot_4)
+
+```
+
+**Lowest Average Flight Delay by Time Interval for Each Year**
+
+```{r}
+avg_time_delay <- dbGetQuery(conn, "
+    WITH ranked_time_delays AS (
+        SELECT Year, TimeInterval, AVG(ArrDelay) AS AvgDelay,
+               ROW_NUMBER() OVER (PARTITION BY Year ORDER BY AVG(ArrDelay)) AS rank
+        FROM flights_clean
+        WHERE Cancelled = 0 AND Diverted = 0 AND ArrDelay > 15
+        GROUP BY Year, TimeInterval
+    )
+    SELECT Year, TimeInterval, AvgDelay
+    FROM ranked_time_delays
+    WHERE rank = 1
+")
+
+print(avg_time_delay)
+```
+
+**Observations from the plot and table above**
+
+We observe that flight delays are generally highest in the early morning hours especially during 0300 to 0559. This indicates that flights during this period experience significantly longer delays than other times of the day. Following this peak, there is a sharp drop in average delay during the 0600 to 0859, where delays reach their lowest point from 2003 to 2007 as indicated by the table on the left, which shows the lowest average flight delay for each year. However, the average flight delay during this interval has increased from 35.2 minutes to 37.3 minutes over the years. Despite this slight rise, early mornings between 0600 and 0859 remain the best option for minimizing delays.
+
+## Conclusion for (a)
+
+Saturday and early mornings from 0600 to 0859 are the best day and time to minimise flight delays. Travelers seeking to reduce the likelihood of delays should prioritize early morning flights and consider scheduling their trips on Saturdays. By focusing on these optimal times and days, airlines and passengers alike can enhance punctuality and improve overall travel efficiency.
+
+# (b) Evaluate whether older planes suffer more delays on a year-to-year basis.
+
+```{r}
+# Glimpse of data
+dbListFields(conn, "planes")
+```
+
+Before merging the flights and planes datasets, we first rename the 'year' column in the planes dataset to avoid confusion, as both data sets contain a column with the same name.
+
+```{r}
+dbExecute(conn, "ALTER TABLE planes RENAME COLUMN year to manu_year")
+```
+
+```{r}
+#shows a list of the data type in each column
+dbGetQuery(conn, "PRAGMA table_info(planes)")
+```
+
+As the manu_year column is in TEXT data type, we change it to integer as we want to calculate the planes age
+
+```{r}
+dbExecute(conn, "UPDATE planes SET manu_year = CAST(manu_year as INTEGER)")
+```
+
+We will create a table in the database named "**flights_planes**" where we will join the "flights_clean" and "planes" table.
+
+```{r}
+dbExecute(conn, "CREATE TABLE flights_planes AS SELECT Year, Month, DayofMonth, DayOfWeek, flights_clean.TailNum, ArrDelay, manu_year 
+          From flights_clean
+          JOIN planes ON flights_clean.TailNum = planes.tailnum
+          WHERE Cancelled = 0 AND Diverted = 0")
+```
+
+Next, we create a new column 'PlanesAge' to determine the planes age.
+
+```{r}
+dbExecute(conn, "ALTER TABLE flights_planes ADD COLUMN PlanesAge INTEGER")
+```
+
+Planes Age is calculated using Year minus manu_year, which is the manufactured year of plane.
+
+```{r}
+dbExecute(conn, "UPDATE flights_planes
+    SET PlanesAge = Year - manu_year") 
+```
+
+```{r}
+dbGetQuery(conn, "SELECT * FROM flights_planes WHERE manu_year = 0")
+```
+
+We noticed that the manu_year for some planes is 0 and it results in the incorrect calculation of the planes age. Therefore, we decided to rows where manu_year is 0 as it could lead to inaccuracy for our analysis.
+
+```{r}
+dbExecute(conn, "DELETE FROM flights_planes WHERE manu_year = 0")
+```
+
+We also noticed that the PlanesAge for some planes is less than 0. Hence, we decided to remove these rows as planes age cannot be less than 0.
+
+```{r}
+dbExecute(conn, "DELETE FROM flights_planes WHERE PlanesAge < 0 ")
+```
+
+## Plot 5: Distribution of the number of flights by Planes Age
+
+We will first find the distribution of the number of flights by Planes Age to understand how many flights each age group would take.
+
+```{r}
+age_distribution <- dbGetQuery(conn, "SELECT PlanesAge, COUNT(*) / 1000000.0 AS FlightCount
+                           FROM flights_planes
+                           GROUP BY PlanesAge")
+
+print(age_distribution)
+```
+
+We will plot a histogram using `geom_bar()`, where x-axis represents the age of the planes and y-axis represents the number of flights.
+
+```{r}
+plot_5 <- ggplot(age_distribution, aes(x = PlanesAge, y = FlightCount)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Figure 7.1 (R): Distribution of Number of Flights by Planes Age",
+    x = "Planes Age (Year)",
+    y = "Number of Flights (millions)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+  
+print(plot_5)
+```
+
+**Observations from the plot above**
+
+We can see that planes older than 22 years have significantly fewer flights compared to planes younger than 22 years old. Due to this smaller sample size, the average delay of planes aged more than 22 may not accurately represent the true average delay. To address this, we will analyze planes aged between 0 and 22 and planes aged more than 22 to better understand the relationship between plane age and flight delays.
+
+## Plot 6: Percentage of Delayed Flights by Planes Age (0 to 22 years)
+
+```{r}
+delay_percent_by_age <- dbGetQuery(conn, "
+        SELECT PlanesAge,
+        (SUM(CASE WHEN ArrDelay > 15 THEN 1 END) * 100.0 / COUNT(*)) AS DelayPercentage
+        FROM flights_planes
+        WHERE PlanesAge <= 22
+        GROUP BY PlanesAge
+")
+
+print(delay_percent_by_age)
+
+```
+
+We will plot a scatter plot using `geom_point()` to visualize the relationship between plane age and the percentage of flights delayed. To highlight the trend in the data, `geom_smooth` is used, which overlays a red linear regression line. `theme_wsj()` applies a Wall Street Journal theme.
+
+```{r}
+plot_6 <- ggplot(delay_percent_by_age, aes(x = PlanesAge, y = DelayPercentage)) +
+  geom_point(size = 3, color = "black") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  
+  labs(
+    title = "Figure 8.1 (R): Percentage of Flights Delayed by Planes Age (0 to 22)",
+    x = "Planes Age (Year)",
+    y = "Percentage of Flights Delay (%)"
+  ) +
+  theme_wsj() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  )
+
+print(plot_6)
+```
+
+**Observations from the plot above**
+
+There is a positive correlation indicating that as planes get older, the percentage of delayed flights increases. Although the trend is upward sloping, individual data points exhibit noticeable variations.
+
+## Plot 7: Percentage of Delayed Flights by Planes Age (more than 22 years)
+
+```{r}
+delay_percent_by_age2 <- dbGetQuery(conn, "
+        SELECT PlanesAge,
+        (SUM(CASE WHEN ArrDelay > 15 THEN 1 END) * 100.0 / COUNT(*)) AS DelayPercentage
+        FROM flights_planes
+        WHERE PlanesAge > 22
+        GROUP BY PlanesAge
+")
+
+print(delay_percent_by_age2)
+```
+
+```{r}
+plot_7 <- ggplot(delay_percent_by_age2, aes(x = PlanesAge, y = DelayPercentage)) +
+  geom_point(size = 3, color = "black") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(
+    title = "Figure 9.1 (R): Percentage of Flights Delayed by Planes Age (more than 22)",
+    x = "Planes Age (Year)",
+    y = "Percentage of Flight Delay (%)"
+  ) +
+  theme_wsj() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10, face = "bold"),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  )
+
+print(plot_7)
+```
+
+**Observations from the plot above**
+
+There is a weak positive correlation between plane age and percentage of delays. This suggest that older planes aged over 22 years may experience a small increase in delay percentage, but the effect is not strong. The data points are widely scattered around the trend line, suggests that older planes do not necessarily experience higher delays at a consistent rate.
+
+## Plot 8: Average Flight Delay based on Planes Age (0 to 22)
+
+```{r}
+avg_delay_by_age <- dbGetQuery(conn, "SELECT PlanesAge, AVG(ArrDelay) AS AvgDelay
+                               FROM flights_planes
+                               WHERE PlanesAge <= 22 AND ArrDelay > 15
+                           GROUP BY PlanesAge")
+```
+
+```{r}
+plot_8 <- ggplot(avg_delay_by_age, aes(x = PlanesAge, y = AvgDelay)) +
+  geom_point(size = 3, color = "blue") +  # Scatterplot points
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(
+    title = "Figure 10.1 (R): Average Flight Delay based on Planes Age (0 to 22)",
+    x = "Planes Age (Years)",
+    y = "Average Flight Delay (minutes)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+print(plot_8)
+```
+
+**Observations from the plot above**
+
+There is a negative correlation between average flight delay and planes age between 0 and 22. The regression line slopes downward suggest that as planes age within this range, delays tend to decrease.
+
+## Plot 9: Average Flight Delay based on Planes Age (more than 22)
+
+```{r}
+avg_delay_by_age2 <- dbGetQuery(conn, "SELECT PlanesAge, AVG(ArrDelay) AS AvgDelay
+                               FROM flights_planes
+                               WHERE ArrDelay > 15 AND PlanesAge > 22
+                               GROUP BY PlanesAge")
+```
+
+```{r}
+plot_9 <- ggplot(avg_delay_by_age2, aes(x = PlanesAge, y = AvgDelay)) +
+  geom_point(size = 3, color = "blue") +  
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(
+    title = "Figure 11.1 (R): Average Flight Delay based on Planes Age (more than 22)",
+    x = "Planes Age (Year)",
+    y = "Average Flight Delay (minutes)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 12, face = "bold"))
+
+print(plot_9)
+```
+
+**Observations from the plot above**
+
+There is a positive correlation between planes age and flight delay. The regression line slopes upwards, indicating that as planes get older, they tend to experience longer delays. However, the relationship is weak as indicated by the scattered data points and the wide confidence interval around the regression line.
+
+Overall, these findings suggest that average delays decrease as planes age from 0 and 22 years but begin to increase for planes older than 22 years. However, the trend for planes older than 22 years is less reliable due to the smaller sample size. The data for planes aged 0 to 22 years is more representative and reliable, making it the focus of our yearly trend analysis.
+
+## Plot 10: Yearly Trend of Percentage Delay based on Planes Age (0 to 22) (Representative)
+
+```{r}
+yearly_percent_delay <- dbGetQuery(conn, "SELECT Year, PlanesAge, 
+                               (SUM(CASE WHEN ArrDelay > 15 THEN 1 END) * 100.0 / COUNT(*)) AS DelayPercentage
+                               FROM flights_planes
+                               WHERE PlanesAge <= 22
+                               GROUP BY Year, PlanesAge")
+```
+
+```{r}
+plot_10 <- ggplot(yearly_percent_delay, aes(x = PlanesAge, y = DelayPercentage)) +
+  geom_point(size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  facet_wrap(~Year) +  
+  labs(title = "Figure 12.1 (R): Yearly Trend of Percentage Delay based on Planes Age (0 to 22)",
+       x = "Plane Age (Year)",
+       y = "Percentage of Flight Delay (%)",
+       color = "Year") +
+  theme_minimal() + 
+  theme(plot.title = element_text(hjust = 0.5, size = 12, face = "bold"))
+
+print(plot_10)
+
+```
+
+**Observations from the plot above**
+
+In 2003, 2004 and 2007, there is a positive correlation between plane age and percentage of delayed flights. This suggests that in these years, older planes generally experienced a higher percentage of delays compared to younger planes. In 2005, the trend appears to be flat, indicating little relationship between plane age and percentage delay. This suggest that planes age did not impact the delay. In 2006, there is a negative correlation. This suggests that newer planes had a slightly higher percentage of delays compared to older planes.
+
+## Plot 11: Yearly Trend of Average Delay based on Planes Age (0 to 22) (Representative)
+
+```{r}
+yearly_delay <- dbGetQuery(conn, "SELECT Year, PlanesAge, AVG(ArrDelay) AS AvgDelay
+                               FROM flights_planes
+                               WHERE ArrDelay > 15 AND PlanesAge <= 22
+                               GROUP BY Year, PlanesAge")
+
+```
+
+```{r}
+plot_11 <- ggplot(yearly_delay, aes(x = PlanesAge, y = AvgDelay)) +
+  geom_point(size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  facet_wrap(~Year) + 
+  labs(title = "Figure 13.1 (R): Yearly Trend of Average Delay based on Planes Age (0 to 22)",
+       x = "Plane Age (Year)",
+       y = "Average Flight Delay (minutes)",
+       color = "Year") +
+  theme_minimal() + 
+  theme(plot.title = element_text(hjust = 0.5, size = 12, face = "bold"))
+
+print(plot_11)
+
+```
+
+**Observations from the plot above**
+
+In 2003, 2004, and 2005, there is a positive correlation suggests that older planes tend to have slightly higher average flight delays. The confidence intervals in 2004 and 2005 are slightly wider, indicating some uncertainty in the trend. In 2006 and 2007, there is a negative correlation, where older planes exhibit shorter average delays compared to newer ones.
+
+## Conclusion for (b)
+
+While older planes aged more than 22 experience increasing delays over time, there is a weak correlation between plane age and delays. For planes aged between 0 to 22, the percentage of delayed flights increases with age, but their average delay time does not necessarily worsen. While there is some evidence that plane age contributes to delays, the effect is not consistent across all years, indicating planes age is not the only determining factor for flight delays.
+
+# (c) Logistic regression model
+
+In this section, we want to fit a logistic regression model for the probability of diverted US flights from 2003 to 2007 based on various flight features such as scheduled departure and arrival times, distance and carrier. To better understand these trends, we will visualize the regression coefficients across the years.
+
+To build the model, we use `mlr3` packages in R as these packages are efficient tools for machine learning.
+
+-   `mlr3` provides a general platform to train and evaluate a wide range of machine learning models.
+-   `mlr3pipelines` enables automated preprocessing and feature engineering through a modular pipeline system.
+-   `mlr3learners` extends mlr3 by adding a variety of machine learning models for classification, regression, and survival analysis.
+
+```{r}
+library('mlr3')
+library('mlr3pipelines')
+library('mlr3learners')
+```
+
+## Merge flights, airports and carriers dataset
+
+We will join flights, airports and carriers table together and select specific features that are relevant for our model.
+
+```{r}
+flights_merged <- dbGetQuery(conn, "
+                  SELECT f.Year, f.Month, f.DayofMonth, f.DayOfWeek, f.CRSDepTime, f.CRSArrTime, f.Distance, f.UniqueCarrier, 
+                  a1.lat As OriginLat, a1.long AS OriginLong, a2.lat AS DestLat, a2.long AS DestLong, f.Diverted
+                  FROM flights_clean f
+                  JOIN airports a1 ON f.Origin = a1.iata
+                  JOIN airports a2 ON f.Dest = a2.iata
+                  WHERE f.Cancelled = 0 ")
+```
+
+## Disconnect database
+
+`dbDisconnect()` close the connection.
+
+```{r}
+dbDisconnect(conn)
+```
+
+```{r}
+colSums(is.na(flights_merged))
+```
+
+We will count the number of diverted and non-diverted flights to understand the distribution of diverted flights in the dataset.
+
+```{r}
+diverted_count <- sum(flights_merged$Diverted == 1)
+non_diverted_count <- sum(flights_merged$Diverted == 0)
+print(diverted_count)
+print(non_diverted_count)
+```
+
+There are 72558 diverted flights and 3463546 non-diverted flights. As the sample size for non-diverted flights are larger than the diverted flight, we decrease the size of the majority class to be the same to the minority class.
+
+```{r}
+set.seed(123)
+flights_sampled <- flights_merged %>%
+  filter(Diverted == 1) %>%  
+  bind_rows(
+    flights_merged %>% filter(Diverted == 0) %>% sample_n(diverted_count) 
+  )
+```
+
+```{r}
+# Check the balance
+table(flights_sampled$Diverted)
+```
+
+Next, we need to convert the DayOfWeek and UniqueCarrier to factors to ensure that they are correctly interpreted by the model. We also need to convert the Diverted column to factor so that can run the classification task. In classification tasks, the target variable represents class labels, which must be categorical. The target column must be a factor for classification task.
+
+```{r}
+flights_sampled <- flights_sampled %>%
+  mutate(
+    DayOfWeek = as.factor(DayOfWeek),
+    UniqueCarrier = as.factor(UniqueCarrier),
+    Diverted = as.factor(Diverted))
+```
+
+```{r}
+#Retrieves a list of unique years in the data
+years <- unique(flights_sampled$Year)
+```
+
+Create a list to store coefficients for each year.
+
+```{r}
+coefficients <- list()
+```
+
+We will then train the logistic regression model by for each year. It involves data preparation, preprocessing, model training and extracting coefficients to analyze how different features influence flight diversions over time.
+
+We first loop through each year in the data to ensure that a separate logistic regression model is trained for each year. Within the loop, it filters the data to include only flights from that specific year. Then, it creates a classification task using `TaskClassif$new()`, where the target variable is "Diverted", indicating whether a flight was diverted (1) or not (0). The features used for prediction exclude "Diverted" and "Year", ensuring the model only learns from relevant flight characteristics.
+
+Next, a logistic regression model is defined using lrn("classif.log_reg") and specifies that it should output probabilities. Since the dataset includes both numerical and categorical variables, a data preprocessing pipeline is built. The pipeline consists of scaling numerical features, one-hot encoding categorical variables, and then feeding the processed data into the logistic regression model.`po()` stands for PipeOp, which is a building block in the mlr3pipelines package for creating data preprocessing and modeling pipelines encode is used to encode categorical variables into a numeric format that machine learning models can understand one-hot encoding converts each category in a categorical variable into binary column. These steps are combined into a "GraphLearner", which simplifies model training and evaluation.
+
+The dataset is divided into 80% training and 20% testing data using `sample()` and `setdiff()`. The model is then trained on the training set with `graph_learner$train()`.
+
+Once the model is trained, the logistic regression coefficients are extracted.The coefficients are stored in a dataframe along with the corresponding feature names and the year of the analysis. Finally, the dataframe is saved in a list named "coefficients", allowing for comparisons across different years.
+
+```{r}
+for (year in years) {
+  data_year <- flights_sampled %>% filter(Year == year)
+  
+  task <- TaskClassif$new(
+    id = paste0("flights_", year),
+    backend = data_year,
+    target = "Diverted",
+    positive = "1"
+  )
+  
+  task$col_roles$feature <- setdiff(names(data_year), c("Diverted", "Year"))
+  
+  learner <- lrn("classif.log_reg", predict_type = "prob")
+  
+  encode <- po("encode", method = "one-hot")
+  
+  preprocess <- po("scale") %>>% encode %>>% learner
+  
+  graph_learner <- GraphLearner$new(preprocess)
+  
+  set.seed(123)
+  train_set <- sample(task$nrow, 0.8 * task$nrow)
+  test_set <- setdiff(seq_len(task$nrow), train_set)
+  
+  graph_learner$train(task, row_ids = train_set)
+  
+  coefs <- graph_learner$model$classif.log_reg$model$coefficients
+  coef_df <- data.frame(
+    Term = names(coefs),
+    Estimate = coefs,
+    Year = year
+  )
+  
+  coefficients[[as.character(year)]] <- coef_df
+
+}
+```
+
+All the individual coefficient data frames are then stored into a single data frame.
+
+```{r}
+coefficients_df <- bind_rows(coefficients)
+```
+
+```{r}
+coefficients_df <- coefficients_df %>%
+  mutate(
+    coef_range = case_when(
+      Estimate <= -1 ~ "Very Negative (less than -1)",
+      Estimate > -1 & Estimate <= 0 ~ "Negative (between -1 and 0)",
+      Estimate > 0 & Estimate <= 1 ~ "Positive (between 0 and 1)",
+      Estimate > 1 ~ "Very Positive(more than 1)"
+    )
+  )
+
+```
+
+```{r}
+coefficients_df$Term <- gsub("^DayOfWeek\\.", "", coefficients_df$Term)
+```
+
+## Plot 12: Logistic Regression Coefficients
+
+We will plot a heatmap using `geom_tile` to visualize the coefficients of the logistic regression model. The `scale_fill_manual()` function assigns colors to four coefficient categories: - Red for "Very Negative" coefficients (less than -1) - Pink for "Negative" coefficients (between -1 and 0) - Blue for "Positive" coefficients (between 0 and 1) - Dark green for "Very Positive" coefficients (greater than 1)
+
+```{r}
+plot_12 <- ggplot(coefficients_df, aes(x = Year, y = Term, fill = coef_range)) +
+  geom_tile(color= "white", size = 0.8) +
+  scale_fill_manual(values = c(
+    "Very Negative (less than -1)" = "red",    
+    "Negative (between -1 and 0)" = "pink",     
+    "Positive (between 0 and 1)" = "steelblue", 
+    "Very Positive(more than 1)" = "darkgreen"  
+  )) +
+  labs(title = "Logistic Regression Coefficients",
+       x = "Year", y = "Feature", fill = "Coefficient") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = 'bold'))
+
+print(plot_12)
+```
+
+**Observations from the plot above**
+
+We can see that some airlines such as Carrier HA show strong negative coefficients, highlighted in red. This suggests that flights operated by this airline were significantly less likely to be diverted during those periods. Meanwhile, other flight attributes such as certain days of the week show positive coefficient, highlighted in blue. Some flight attributes are highlighted in grey, which indicates insufficient data or a lack of significant correlation with diversions.
+
+## Conclusion for (c)
+
+Factors such as time and airport locations appear to have less impact on the probabilities of flight diversion while airline carriers seem to have some impact on the probabilities of flight diversion.
